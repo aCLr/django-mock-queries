@@ -95,3 +95,7 @@ DjangoDbRouter = locate('django.db.router')
 DjangoModelDeletionCollector = locate('django.db.models.deletion.Collector')
 ObjectDoesNotExist = locate('django.core.exceptions.ObjectDoesNotExist')
 MultipleObjectsReturned = locate('django.core.exceptions.MultipleObjectsReturned')
+
+VALUES_AS_DICT = 0
+VALUES_AS_LIST = 1
+VALUES_AS_FLAT_LIST = 2

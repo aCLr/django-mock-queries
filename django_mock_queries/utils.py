@@ -1,3 +1,4 @@
+from uuid import UUID
 from datetime import datetime, date
 from django.core.exceptions import FieldError
 from django.db.models import F, Value, Case
@@ -221,13 +222,14 @@ def is_match_in_children(comparison, first, second):
 def is_disqualified(obj, attrs, negated):
     for attr_name, filter_value in attrs.items():
         attr_value, comparison = get_attribute(obj, attr_name)
+        if isinstance(attr_value, UUID) and isinstance(filter_value, str):
+            attr_value = str(attr_value)
         match = is_match(attr_value, filter_value, comparison)
 
         if (match and negated) or (not match and not negated):
             return True
 
     return False
-
 
 def matches(*source, **attrs):
     negated = attrs.pop('negated', False)
@@ -236,7 +238,7 @@ def matches(*source, **attrs):
     return [x for x in source if x not in disqualified]
 
 
-def validate_mock_set(mock_set, for_update=False, **fields):
+def validate_mock_set(mock_set, for_update=False, **fields):`
     if mock_set.model is None:
         raise ModelNotSpecified()
 
@@ -268,7 +270,7 @@ def is_list_like_iter(obj):
     elif isinstance(obj, Mock):
         return False
 
-    return hasattr(obj, '__iter__') and not isinstance(obj, str)
+    return hasattr(obj, '__iter__') and not isinstance(obj, (str, dict))
 
 
 def is_like_date_or_datetime(obj):
@@ -333,3 +335,18 @@ def _filter_single_q(source, q_obj, negated):
         return filter_results(source, q_obj)
     else:
         return matches(negated=negated, *source, **{q_obj[0]: q_obj[1]})
+
+
+def filter_objects(objects, filters):
+    results = list(objects)
+    attr_filters = {}
+    for x in filters:
+        if isinstance(x, tuple):
+            attr_filters[x[0]] = x[1]
+            continue
+        if not isinstance(x, DjangoQ):
+            raise ArgumentNotSupported()
+        if len(x) > 0:
+            results = filter_results(results, x)
+    results = matches(*results, **attr_filters)
+    return results

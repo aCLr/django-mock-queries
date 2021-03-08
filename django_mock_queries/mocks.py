@@ -1,14 +1,20 @@
 import os
 import sys
+from contextlib import AbstractContextManager, ContextDecorator
+
 import django
 import weakref
 from django.apps import apps
-from django.db import connections
+from django.db import connections, transaction
 from django.db.backends.base import creation
-from django.db.models import Model
-from django.db.utils import ConnectionHandler, NotSupportedError
+from django.db.models import Model, fields
+from django.db.models.fields.related_descriptors import ForwardManyToOneDescriptor
+from django.db.utils import ConnectionHandler, NotSupportedError, DEFAULT_DB_ALIAS
 from functools import partial
 from itertools import chain
+
+from .storage import add_to_storage, remove_from_storage, make_storage
+
 try:
     from unittest.mock import Mock, MagicMock, patch, PropertyMock
 except ImportError:
@@ -85,6 +91,7 @@ def mock_django_connection(disabled_features=None):
     ConnectionHandler.__getitem__ = MagicMock(name='mock_connection')
     # noinspection PyUnresolvedReferences
     mock_connection = ConnectionHandler.__getitem__.return_value
+    mock_connection.alias = 'default'
     if disabled_features:
         for feature in disabled_features:
             setattr(mock_connection.features, feature, False)
@@ -185,12 +192,55 @@ def find_all_models(models):
                 yield parent_model
 
 
-def _patch_save(model, name):
-    return patch_object(
-        model,
-        'save',
-        new_callable=partial(Mock, name=name + '.save')
-    )
+_atomics = []
+
+
+class _Atomic(ContextDecorator):
+    def __init__(self, using, savepoint):
+        self.using = using
+        self.savepoint = savepoint
+
+    def __enter__(self):
+        make_storage()
+        return
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            raise
+
+
+def _patch_atomic():
+    def _atomic(using=None, savepoint=True):
+        if callable(using):
+            at = _Atomic(DEFAULT_DB_ALIAS, savepoint)
+            return at(using)
+        # Decorator: @atomic(...) or context manager: with atomic(...): ...
+        else:
+            return _Atomic(using, savepoint)
+    transaction.atomic = _atomic
+
+def _empty(*args, **kwargs):
+    pass
+
+Model.save_base = _empty
+
+def _patch_save(model):
+    orig = model.save
+
+    def _save(*args, **kwargs):
+        self = args[0]
+        orig(self)
+        for field in self._meta.fields:
+            if field.has_default() and getattr(self, field.name, None) is None:
+                setattr(self, field.name, field.get_default())
+        add_to_storage(self)
+    model.save = _save
+
+
+def _patch_delete(model):
+    def _delete(*args, **kwargs):
+        remove_from_storage(args[0])
+    model.delete = _delete
 
 
 def _patch_objects(model, name):
@@ -211,6 +261,15 @@ def _patch_relation(model, name, related_object):
     return patch_object(model, name, new_callable=new_callable)
 
 
+def _patch_forward_relation():
+
+    def _get_queryset(*args, **kwargs):
+        self = args[0]
+        return MockSet(model=self.field.remote_field.model)
+
+    ForwardManyToOneDescriptor.get_queryset = _get_queryset
+
+
 # noinspection PyProtectedMember
 def mocked_relations(*models):
     """ Mock all related field managers to make pure unit tests possible.
@@ -225,14 +284,16 @@ def mocked_relations(*models):
         check = dataset.content_checks.create()  # returns a ContentCheck object
     """
     patchers = []
-
+    _patch_atomic()
+    _patch_forward_relation()
     for model in find_all_models(models):
         if isinstance(model.save, Mock):
             # already mocked, so skip it
             continue
 
         model_name = model._meta.object_name
-        patchers.append(_patch_save(model, model_name))
+        _patch_save(model)
+        _patch_delete(model)
 
         if hasattr(model, 'objects'):
             patchers.append(_patch_objects(model, model_name))

@@ -1,7 +1,12 @@
 import datetime
 import random
 from collections import OrderedDict, namedtuple
+from copy import copy
+
 from six import with_metaclass
+
+from .storage import get_models_from_storage, remove_from_storage, add_to_storage
+
 try:
     from unittest.mock import Mock, MagicMock, PropertyMock
 except ImportError:
@@ -11,14 +16,14 @@ from .constants import *
 from .exceptions import *
 from .utils import (
     matches, merge, intersect, get_attribute, validate_mock_set, is_list_like_iter, flatten_list, truncate,
-    hash_dict, filter_results
+    hash_dict, filter_results, filter_objects
 )
 
 
 class MockSetMeta(type):
     def __call__(cls, *initial_items, **kwargs):
         obj = super(MockSetMeta, cls).__call__(**kwargs)
-        obj.add(*initial_items)
+        # obj.add(*initial_items)
         return obj
 
 
@@ -39,7 +44,65 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         'iterator'
     ]
 
-    def __init__(self, *initial_items, **kwargs):
+    def _get_items(self):
+        results = filter_objects(get_models_from_storage(self.model), self._filters)
+
+        if self._exclusions:
+            excluded = set(filter_objects(results, self._exclusions))
+            results = [item for item in results if item not in excluded]
+
+        for key, value in self._annotations.items():
+            for x, row in enumerate(results):
+                row = copy(row)
+                if not hasattr(row, '_annotated_fields'):
+                    row._annotated_fields = []
+                row._annotated_fields.append(key)
+                setattr(row, key, get_attribute(row, value)[0])
+                results[x] = row
+
+        for field in reversed(self._order_by):
+            if field == '?':
+                random.shuffle(results)
+                break
+            is_reversed = field.startswith('-')
+            attr = field[1:] if is_reversed else field
+            results = sorted(results,
+                             key=lambda r: get_attribute(r, attr),
+                             reverse=is_reversed)
+
+        if self._distincts:
+            distinct_results = OrderedDict()
+            for item in results:
+                key = hash_dict(item, *self._distincts)
+                if key not in distinct_results:
+                    distinct_results[key] = item
+            results = list(distinct_results.values())
+
+        if self._values:
+            as_dict = self._values_params['as_dict']
+            as_values = []
+            for row in results:
+                as_values.extend(self._item_values(row, self._values))
+            if as_dict:
+                results = as_values
+            else:
+                results = []
+                for row in as_values:
+                    results.append(self._values_row(row, self._values, **self._values_params))
+        return results
+
+    def _clone(self):
+        new = MockSet(model=self.model)
+        new._filters = self._filters.copy()
+        new._exclusions = self._exclusions.copy()
+        new._values_params = self._values_params.copy()
+        new._values = self._values.copy()
+        new._annotations = self._annotations.copy()
+        new._order_by = self._order_by.copy()
+        new._distincts = self._distincts.copy()
+        return new
+
+    def __init__(self, **kwargs):
         clone = kwargs.pop('clone', None)
         model = kwargs.pop('model', None)
 
@@ -48,23 +111,28 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
 
         super(MockSet, self).__init__(spec=DjangoQuerySet, **kwargs)
 
-        self.items = list()
-        self.clone = clone
+        self._values = []
+        self._values_params = {}
+        self._annotations = {}
+        self._exclusions = []
+        self._filters = []
+        self._order_by = []
+        self._distincts = []
+
         self.model = getattr(clone, 'model', model)
+        self.clone = clone
         self.events = {}
 
-        self.add(*initial_items)
-
-        self.__len__ = lambda s: len(s.items)
-        self.__iter__ = lambda s: iter(s.items)
-        self.__getitem__ = lambda s, k: self.items[k]
-        self.__bool__ = self.__nonzero__ = lambda s: len(s.items) > 0
+        self.__len__ = lambda s: len(s._get_items())
+        self.__iter__ = lambda s: iter(s._get_items())
+        self.__getitem__ = lambda s, k: self._get_items()[k]
+        self.__bool__ = self.__nonzero__ = lambda s: len(s._get_items()) > 0
 
     def _return_self(self, *_, **__):
         return self
 
     def count(self):
-        return len(self.items)
+        return len(self._get_items())
 
     def fire(self, obj, *events):
         for name in events:
@@ -87,60 +155,54 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         if self.model:
             # Initialize MockModel default fields from MockSet model fields if defined
             for obj in models:
+                if isinstance(obj, dict):
+                    continue
                 self._register_fields(obj)
 
         for model in models:
-            self.items.append(model)
+            if isinstance(obj, dict):
+                continue
+            add_to_storage(model)
             self.fire(model, self.EVENT_ADDED, self.EVENT_SAVED)
 
     def filter(self, *args, **attrs):
-        results = list(self.items)
-        for x in args:
-            if not isinstance(x, DjangoQ):
-                raise ArgumentNotSupported()
-
-            if len(x) > 0:
-                results = filter_results(results, x)
-
-        return MockSet(*matches(*results, **attrs), clone=self)
+        new = self._clone()
+        new._filters += list(args)
+        new._filters += list(attrs.items())
+        return new
 
     def exclude(self, *args, **attrs):
-        excluded = set(self.filter(*args, **attrs))
-        results = [item for item in self.items if item not in excluded]
-        return MockSet(*results, clone=self)
+        new = self._clone()
+        new._exclusions += list(args)
+        new._exclusions += list(attrs.items())
+        return new
 
     def exists(self):
-        return len(self.items) > 0
+        return len(self._get_items()) > 0
 
     def in_bulk(self, id_list=None, *, field_name='pk'):
         result = {}
-        for model in self.items:
+        for model in self._get_items():
             if id_list is None or model.pk in id_list:
                 result[getattr(model, field_name)] = model
         return result
 
     def annotate(self, **kwargs):
-        results = list(self.items)
-        for key, value in kwargs.items():
-            for row in results:
-                if not hasattr(row, '_annotated_fields'):
-                    row._annotated_fields = []
-                row._annotated_fields.append(key)
-                setattr(row, key, get_attribute(row, value)[0])
-
-        return MockSet(*results, clone=self)
+        new = self._clone()
+        new._annotations.update(kwargs)
+        return new
 
     def aggregate(self, *args, **kwargs):
         result = {}
 
         for expr in set(args):
             kwargs['{0}__{1}'.format(expr.source_expressions[0].name, expr.function).lower()] = expr
-
+        items = list(self._get_items())
         for alias, expr in kwargs.items():
             values = []
             expr_result = None
 
-            for x in self.items:
+            for x in items:
                 val = get_attribute(x, expr.source_expressions[0].name)[0]
                 if val is None:
                     continue
@@ -163,25 +225,14 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         return result
 
     def order_by(self, *fields):
-        results = self.items
-        for field in reversed(fields):
-            if field == '?':
-                random.shuffle(results)
-                break
-            is_reversed = field.startswith('-')
-            attr = field[1:] if is_reversed else field
-            results = sorted(results,
-                             key=lambda r: get_attribute(r, attr),
-                             reverse=is_reversed)
-        return MockSet(*results, clone=self)
+        new = self._clone()
+        new._order_by += fields
+        return new
 
     def distinct(self, *fields):
-        results = OrderedDict()
-        for item in self.items:
-            key = hash_dict(item, *fields)
-            if key not in results:
-                results[key] = item
-        return MockSet(*results.values(), clone=self)
+        new = self._clone()
+        new._distincts += list(fields)
+        return new
 
     def _raise_does_not_exist(self):
         does_not_exist = getattr(self.model, 'DoesNotExist', ObjectDoesNotExist)
@@ -219,7 +270,7 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         order_fields = self._get_order_fields(fields, field_name)
 
         results = sorted(
-            self.items,
+            self._get_items(),
             key=lambda obj: tuple(get_attribute(obj, key) for key in order_fields),
             reverse=reverse,
         )
@@ -236,17 +287,20 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         return self._earliest_or_latest(*fields, reverse=True, **field_kwargs)
 
     def first(self):
-        for item in self.items:
-            return item
+        items = self._get_items()
+        if items:
+            return items[0]
 
     def last(self):
-        return self.items and self.items[-1] or None
+        items = self._get_items()
+        if items:
+            return items[-1]
 
     def create(self, **attrs):
         validate_mock_set(self, **attrs)
 
         obj = self.model(**attrs)
-        self.add(obj)
+        obj.save()
 
         return obj
 
@@ -254,7 +308,7 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         validate_mock_set(self, for_update=True, **attrs)
 
         count = 0
-        for item in self.items:
+        for item in self._get_items():
             count += 1
             for k, v in attrs.items():
                 setattr(item, k, v)
@@ -262,9 +316,13 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
 
         return count
 
+    def bulk_create(self, items):
+        for item in items:
+            add_to_storage(item)
+
     def _delete_recursive(self, *items_to_remove, **attrs):
         for item in matches(*items_to_remove, **attrs):
-            self.items.remove(item)
+            remove_from_storage(item)
             self.fire(item, self.EVENT_DELETED)
 
         if self.clone is not None:
@@ -272,7 +330,7 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
 
     def delete(self, **attrs):
         # Delete normally doesn't take **attrs - they're only needed for remove
-        self._delete_recursive(*self.items, **attrs)
+        self._delete_recursive(*self._get_items(), **attrs)
 
     # The following 2 methods were kept for backwards compatibility and
     # should be removed in the future since they are covered by filter & delete
@@ -282,8 +340,8 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
     def remove(self, **attrs):
         return self.delete(**attrs)
 
-    def get(self, **attrs):
-        results = self.filter(**attrs)
+    def get(self, *args, **attrs):
+        results = self.filter(*args, **attrs)
         if not results.exists():
             self._raise_does_not_exist()
         elif results.count() > 1:
@@ -353,15 +411,6 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
 
         return item_values
 
-    def values(self, *fields):
-        result = []
-
-        for item in self.items:
-            item_values = self._item_values(item, fields)
-            result.extend(item_values)
-
-        return MockSet(*result, clone=self)
-
     def _item_values_list(self, values_dict, fields, flat):
         if flat:
             return values_dict[fields[0]]
@@ -374,6 +423,7 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
     def _values_row(self, values_dict, fields, **kwargs):
         flat = kwargs.pop('flat', False)
         named = kwargs.pop('named', False)
+        kwargs.pop('as_dict', None)
 
         if kwargs:
             raise TypeError('Unexpected keyword arguments to values_list: %s' % (list(kwargs),))
@@ -390,19 +440,21 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
 
         return row
 
+    def values(self, *fields):
+        new = self._clone()
+        new._values = list(fields)
+        new._values_params = {'as_dict': True}
+        return new
+
     def values_list(self, *fields, **kwargs):
         # Django doesn't complain about this:
         # https://github.com/django/django/blob/a4e6030904df63b3f10aa0729b86dc6942b0458e/django/db/models/query.py#L845
         # if len(fields) == 0:
         #     raise NotImplementedError('values_list() with no arguments is not implemented')
-
-        result = []
-        item_values_dicts = list(self.values(*fields))
-
-        for values_dict in item_values_dicts:
-            result.append(self._values_row(values_dict, fields, **kwargs))
-
-        return MockSet(*result, clone=self)
+        new = self._clone()
+        new._values = list(fields)
+        new._values_params = {'as_dict': False, **kwargs}
+        return new
 
     def _date_values(self, field, kind, order, key_func):
         initial_values = list(self.values_list(field, flat=True))
@@ -432,7 +484,7 @@ class MockModel(dict):
     def __init__(self, *args, **kwargs):
         super(MockModel, self).__init__(*args, **kwargs)
 
-        self.save = PropertyMock()
+        # self.save = PropertyMock()
         self.__meta = MockOptions(*self.get_fields())
 
     def __getattr__(self, item):

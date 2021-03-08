@@ -1058,6 +1058,13 @@ class TestQuery(TestCase):
         assert results_with_fields[1]['foo'] == 2
         assert results_with_fields[1]['bar'] == 4
 
+    def test_with_reges(self):
+        with mocked_relations(Car):
+            car = Car(model='123_data_12323')
+            self.mock_set.add(car)
+            self.assertEqual(Car.objects.filter(model__regex='data').count(), 1)
+            self.assertEqual(Car.objects.filter(model__regex='^123_data_12323$').count(), 1)
+
     def test_query_values_of_nested_field(self):
         with mocked_relations(Manufacturer, Car):
             make = Manufacturer(name='vw')
