@@ -1,7 +1,9 @@
+import operator
 from uuid import UUID
 from datetime import datetime, date
 from django.core.exceptions import FieldError
 from django.db.models import F, Value, Case
+from django.db.models.expressions import CombinedExpression
 from django.db.models.functions import Coalesce
 
 try:
@@ -54,7 +56,8 @@ def find_field_names_from_meta(meta, annotated=None, **kwargs):
 
     for field in fields_with_mapping:
         field_names.update(get_field_mapping(field))
-
+    field_names['id'] = 'pk'
+    field_names['pk'] = 'id'
     return list(field_names.keys()), list(field_names.values())
 
 
@@ -68,7 +71,7 @@ def find_field_names_from_obj(obj, **kwargs):
         use_obj = getattr(obj, 'model', None)
 
         # Make it easier for MockSet, but Django's QuerySet will always have a model.
-        if not use_obj and is_list_like_iter(obj) and len(obj) > 0:
+        if is_list_like_iter(obj) and len(obj) > 0:
             lookup_fields, actual_fields = find_field_names(obj[0], **kwargs)
 
     return lookup_fields, actual_fields
@@ -101,12 +104,31 @@ def validate_field(field_name, model_fields, for_update=False):
 def get_field_value(obj, field_name, default=None):
     if type(obj) is dict:
         return obj.get(field_name, default)
+    elif field_name == 'len':
+        return len(obj)
     elif is_list_like_iter(obj):
-        return [get_attribute(x, field_name, default)[0] for x in obj]
+        preres = [get_attribute(x, field_name, default)[0] for x in obj]
+        res = []
+        for r in preres:
+            if is_list_like_iter(r):
+                res.extend(r)
+            else:
+                res.append(r)
+        return res
     elif is_like_date_or_datetime(obj):
         return obj
     else:
         return getattr(obj, field_name, default)
+
+def _combined(obj, expr):
+    left = get_attribute(obj, expr.lhs)[0]
+    right = get_attribute(obj, expr.rhs)[0]
+    return {
+        '+': lambda: operator.add(left, right),
+        '-': lambda: operator.sub(left, right),
+        '*': lambda: operator.mul(left, right),
+        '/': lambda: operator.truediv(left, right),
+    }[expr.connector](), None
 
 
 def get_attribute(obj, attr, default=None):
@@ -116,6 +138,8 @@ def get_attribute(obj, attr, default=None):
         attr = attr.deconstruct()[1][0]
     elif isinstance(attr, Value):
         return attr.value, None
+    elif isinstance(attr, CombinedExpression):
+        return _combined(obj, attr)
     elif isinstance(attr, Case):
         for case in attr.cases:
             if filter_results([obj], case.condition):
@@ -153,7 +177,9 @@ def get_attribute(obj, attr, default=None):
 def is_match(first, second, comparison=None):
     if isinstance(first, django_mock_queries.query.MockSet):
         return is_match_in_children(comparison, first, second)
-    if (isinstance(first, (int, str)) and
+    if is_list_like_iter(first):
+        return is_match_in_children(comparison, first, second)
+    if (isinstance(first, (int, str, UUID)) and
             isinstance(second, django_mock_queries.query.MockSet)):
         second = convert_to_pks(second)
     if (isinstance(first, date) or isinstance(first, datetime)) \
@@ -208,10 +234,19 @@ def extract(obj, comparison):
 
 
 def convert_to_pks(query):
-    try:
-        return [item.pk for item in query]
-    except AttributeError:
-        return query  # Didn't have pk's, keep original items
+    res = []
+    qr = list(query)
+    if not qr:
+        return []
+    first = qr[0]
+    if isinstance(first, dict) and len(first) == 1:
+        key = list(first.keys())[0]
+        return [r[key] for r in qr]
+    else:
+        try:
+            return [item.pk for item in qr]
+        except AttributeError:
+            return query  # Didn't have pk's, keep original items
 
 
 def is_match_in_children(comparison, first, second):
@@ -222,8 +257,11 @@ def is_match_in_children(comparison, first, second):
 def is_disqualified(obj, attrs, negated):
     for attr_name, filter_value in attrs.items():
         attr_value, comparison = get_attribute(obj, attr_name)
-        if isinstance(attr_value, UUID) and isinstance(filter_value, str):
-            attr_value = str(attr_value)
+        if isinstance(attr_value, UUID):
+            if isinstance(filter_value, str):
+                attr_value = str(attr_value)
+            elif filter_value and isinstance(filter_value, (list, tuple)) and isinstance(filter_value[0], str):
+                attr_value = str(attr_value)
         match = is_match(attr_value, filter_value, comparison)
 
         if (match and negated) or (not match and not negated):
@@ -238,7 +276,7 @@ def matches(*source, **attrs):
     return [x for x in source if x not in disqualified]
 
 
-def validate_mock_set(mock_set, for_update=False, **fields):`
+def validate_mock_set(mock_set, for_update=False, **fields):
     if mock_set.model is None:
         raise ModelNotSpecified()
 

@@ -1,19 +1,31 @@
+import inspect
 import os
 import sys
-from contextlib import AbstractContextManager, ContextDecorator
+from collections import defaultdict
+from contextlib import ContextDecorator
+
+from django.contrib.auth.management import _get_all_permissions
+from django.contrib.auth.models import Permission
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ObjectDoesNotExist
+from decimal import Decimal
 
 import django
 import weakref
 from django.apps import apps
 from django.db import connections, transaction
 from django.db.backends.base import creation
-from django.db.models import Model, fields
+from django.db.models import Model, Manager, ManyToOneRel
 from django.db.models.fields.related_descriptors import ForwardManyToOneDescriptor
+from django.db.models.signals import post_save
 from django.db.utils import ConnectionHandler, NotSupportedError, DEFAULT_DB_ALIAS
-from functools import partial
+from functools import partial, wraps
 from itertools import chain
 
-from .storage import add_to_storage, remove_from_storage, make_storage
+from django_mock_queries.storage import get_models_from_storage
+
+from .storage import add_to_storage, remove_from_storage, STORAGE
 
 try:
     from unittest.mock import Mock, MagicMock, patch, PropertyMock
@@ -155,6 +167,92 @@ class MockOneToManyMap(MockMap):
 
         return related_objects
 
+class MockManyToOneMap(MockMap):
+    def __get__(self, instance, owner):
+        """ Look in the map to see if there is a related set.
+
+        If not, create a new set.
+        """
+
+        if instance is None:
+            # Call was to the class, not an object.
+            return self
+
+        instance_id = id(instance)
+        entry = self.map.get(instance_id)
+        old_instance = related_objects = None
+        if entry is not None:
+            old_instance_weak, related_objects = entry
+            old_instance = old_instance_weak()
+        if entry is None or old_instance is None:
+            related = getattr(self.original, 'related', self.original)
+            related_objects = MockSet(model=related.field.model)
+            orig_create = related_objects.create
+            orig_fetch = related_objects._get_items
+            self_rel = self
+
+            def _create(*args, **kwargs):
+                nonlocal self_rel, instance
+                if self_rel.original.field.attname not in kwargs and self_rel.original.field.name not in kwargs:
+                    kwargs[self_rel.original.field.name] = instance
+                return orig_create(*args, **kwargs)
+
+            def _get_items(*args, **kwargs):
+                nonlocal self_rel, instance, related_objects
+                related_objects._filters.append((self_rel.original.field.attname, instance.pk))
+                r = orig_fetch(*args, **kwargs)
+                related_objects._filters.pop()
+                return r
+
+            related_objects.create = _create
+            related_objects._get_items = _get_items
+            self.__set__(instance, related_objects)
+
+        return related_objects
+
+
+class MockGenericFkey(MockMap):
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+
+        # Don't use getattr(instance, self.ct_field) here because that might
+        # reload the same ContentType over and over (#5570). Instead, get the
+        # content type ID here, and later when the actual instance is needed,
+        # use ContentType.objects.get_for_id(), which has a global cache.
+        f = self.model._meta.get_field(self.ct_field)
+        ct_id = getattr(instance, f.get_attname(), None)
+        pk_val = getattr(instance, self.fk_field)
+
+        rel_obj = self.get_cached_value(instance, default=None)
+        if rel_obj is not None:
+            ct_match = ct_id == rel_obj.__class__
+            pk_match = rel_obj._meta.pk.to_python(pk_val) == rel_obj.pk
+            if ct_match and pk_match:
+                return rel_obj
+            else:
+                rel_obj = None
+        if ct_id is not None:
+            ct = self.get_content_type(id=ct_id, using=instance._state.db)
+            try:
+                rel_obj = ct.get_object_for_this_type(pk=pk_val)
+            except ObjectDoesNotExist:
+                pass
+        self.set_cached_value(instance, rel_obj)
+        return rel_obj
+
+    def __set__(self, instance, value):
+        ct = None
+        fk = None
+        if value is not None:
+
+            ct = ContentType.objects.get_for_model(value)
+            fk = value.pk
+
+        setattr(instance, self.ct_field, ct)
+        setattr(instance, self.fk_field, fk)
+        self.set_cached_value(instance, value)
+
 
 class MockOneToOneMap(MockMap):
     def __get__(self, instance, owner):
@@ -166,13 +264,12 @@ class MockOneToOneMap(MockMap):
         if instance is None:
             # Call was to the class, not an object.
             return self
-
-        entry = self.map.get(id(instance))
-        old_instance = related_object = None
-        if entry is not None:
-            old_instance_weak, related_object = entry
-            old_instance = old_instance_weak()
-        if entry is None or old_instance is None:
+        related_object = None
+        for obj in get_models_from_storage(self.original.related.related_model):
+            if getattr(obj, self.original.related.field.attname) == instance.pk:
+                related_object = obj
+                break
+        if related_object is None:
             raise self.original.RelatedObjectDoesNotExist(
                 "Mock %s has no %s." % (
                     owner.__name__,
@@ -192,24 +289,26 @@ def find_all_models(models):
                 yield parent_model
 
 
-_atomics = []
-
-
 class _Atomic(ContextDecorator):
     def __init__(self, using, savepoint):
         self.using = using
         self.savepoint = savepoint
 
     def __enter__(self):
-        make_storage()
+        STORAGE.begin_transaction()
         return
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
+            STORAGE.rollback_transaction()
             raise
+        if STORAGE._need_rollback:
+            STORAGE.rollback_transaction()
+        else:
+            STORAGE.commit_transaction()
 
 
-def _patch_atomic():
+def _patch_transaction():
     def _atomic(using=None, savepoint=True):
         if callable(using):
             at = _Atomic(DEFAULT_DB_ALIAS, savepoint)
@@ -217,23 +316,38 @@ def _patch_atomic():
         # Decorator: @atomic(...) or context manager: with atomic(...): ...
         else:
             return _Atomic(using, savepoint)
+
+    def _set_rollback(value, *args, **kwargs):
+        STORAGE.set_rollback(value)
+
     transaction.atomic = _atomic
+    transaction.set_rollback = _set_rollback
+
 
 def _empty(*args, **kwargs):
     pass
 
+
 Model.save_base = _empty
+
 
 def _patch_save(model):
     orig = model.save
 
     def _save(*args, **kwargs):
         self = args[0]
+        add = self.pk is None
         orig(self)
         for field in self._meta.fields:
-            if field.has_default() and getattr(self, field.name, None) is None:
+            field.pre_save(self, add)
+            cur_val = getattr(self, field.name, None)
+            if field.has_default() and cur_val is None:
                 setattr(self, field.name, field.get_default())
+            if cur_val is not None and field.get_internal_type() == 'DecimalField' and not isinstance(cur_val, Decimal):
+                setattr(self, field.name, field.to_python(cur_val))
+
         add_to_storage(self)
+        post_save.send(self.__class__, instance=self, created=True)
     model.save = _save
 
 
@@ -241,6 +355,15 @@ def _patch_delete(model):
     def _delete(*args, **kwargs):
         remove_from_storage(args[0])
     model.delete = _delete
+
+
+def _patch_refresh_from_db(model):
+    def _refresh(*args, **kwargs):
+        self = args[0]
+        new = STORAGE.get_object_from_storage(self.__class__, self.pk)
+        for field in self._meta.fields:
+            setattr(self, field.name, getattr(new, field.name, None))
+    model.refresh_from_db = _refresh
 
 
 def _patch_objects(model, name):
@@ -252,13 +375,18 @@ def _patch_objects(model, name):
 
 def _patch_relation(model, name, related_object):
     relation = getattr(model, name)
-
-    if related_object.one_to_one:
+    if related_object.__class__ is ManyToOneRel:
+        new_callable = partial(MockManyToOneMap, relation)
+    elif related_object.one_to_one:
         new_callable = partial(MockOneToOneMap, relation)
     else:
         new_callable = partial(MockOneToManyMap, relation)
 
     return patch_object(model, name, new_callable=new_callable)
+
+
+def _patch_generic_fkey(model, field):
+    return patch_object(model, field.name, new_callable=partial(MockGenericFkey, field))
 
 
 def _patch_forward_relation():
@@ -270,6 +398,7 @@ def _patch_forward_relation():
     ForwardManyToOneDescriptor.get_queryset = _get_queryset
 
 
+_mocked_models = []
 # noinspection PyProtectedMember
 def mocked_relations(*models):
     """ Mock all related field managers to make pure unit tests possible.
@@ -284,8 +413,9 @@ def mocked_relations(*models):
         check = dataset.content_checks.create()  # returns a ContentCheck object
     """
     patchers = []
-    _patch_atomic()
+    _patch_transaction()
     _patch_forward_relation()
+
     for model in find_all_models(models):
         if isinstance(model.save, Mock):
             # already mocked, so skip it
@@ -294,10 +424,14 @@ def mocked_relations(*models):
         model_name = model._meta.object_name
         _patch_save(model)
         _patch_delete(model)
+        _patch_refresh_from_db(model)
 
         if hasattr(model, 'objects'):
+            # patch_custom_manager_methods(model)
             patchers.append(_patch_objects(model, model_name))
-
+        for generic_fkey in model._meta._forward_fields_map.values():
+            if isinstance(generic_fkey, GenericForeignKey):
+                patchers.append(_patch_generic_fkey(model, generic_fkey))
         for related_object in chain(model._meta.related_objects,
                                     model._meta.many_to_many):
             name = related_object.name
@@ -311,7 +445,7 @@ def mocked_relations(*models):
                     patchers.append(_patch_relation(
                         model, name, related_object
                     ))
-
+        _mocked_models.append(model)
     return PatcherChain(patchers, pass_mocks=False)
 
 
@@ -382,7 +516,10 @@ class PatcherChain(object):
             patcher.__exit__(exc_type, exc_val, exc_tb)
 
     def start(self):
-        return [patcher.start() for patcher in self.patchers]
+        r = [patcher.start() for patcher in self.patchers]
+        for f in after_patch:
+            f()
+        return r
 
     def stop(self):
         for patcher in reversed(self.patchers):
@@ -563,3 +700,89 @@ class ModelMocker(Mocker):
             return delete(self.state.pop('collector'), *args, **kwargs)
         else:
             return self.objects.filter(pk=getattr(model, self.cls._meta.pk.attname)).delete()
+
+
+def patch_custom_manager_methods(model):
+    if model.objects.__class__ is Manager:
+        return
+    diff = set(dir(model.objects)).difference(dir(Manager))
+    custom = []
+    for arg in diff:
+        to_patch = getattr(model.objects, arg)
+        if inspect.ismethod(to_patch):
+            custom.append(to_patch)
+    with_custom_manager_methods(model, *custom)
+
+
+def with_custom_manager_methods(model, *args):
+    for arg in args:
+        _custom_manager_methods[model].append(arg)
+
+
+def _wrap(func, model):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return func.__func__(model.objects, *args, **kwargs)
+    return wrapper
+
+
+_custom_manager_methods = defaultdict(list)
+with_custom_manager_methods(
+    ContentType,
+    _wrap(ContentType.objects.get_for_model, ContentType),
+    ContentType.objects._get_opts,
+    ContentType.objects._get_from_cache,
+    ContentType.objects._add_to_cache,
+)
+# _custom_manager_methods[ContentType] = [
+#     ContentType.objects.get_for_model,
+#     ContentType.objects._get_opts,
+#     ContentType.objects._get_from_cache,
+#     ContentType.objects._add_to_cache,
+# ]
+#
+mocked_relations(ContentType)
+
+
+def _setup_custom_manager_methods():
+    for model, methods in _custom_manager_methods.items():
+        for method in methods:
+            setattr(model.objects, method.__name__, method)
+
+
+def _setup_permissions():
+    searched_perms = []
+    # The codenames and ctypes that should exist.
+    ctypes = set()
+
+
+    for app_config in apps.get_app_configs():
+        for klass in app_config.get_models():
+            # Force looking up the content types in the current database
+            # before creating foreign keys to them.
+            ctype = ContentType(app_label=app_config.label,
+                        model=klass._meta.model_name)
+            ctype.save()
+
+            ctypes.add(ctype)
+            for perm in _get_all_permissions(klass._meta):
+                searched_perms.append((ctype, perm))
+
+    # Find all the Permissions that have a content_type for a model we're
+    # looking for.  We don't need to check for codenames since we already have
+    # a list of the ones we're going to create.
+    all_perms = set(Permission.objects.filter(
+        content_type__in=ctypes,
+    ).values_list(
+        "content_type", "codename"
+    ))
+
+    perms = [
+        Permission(codename=codename, name=name, content_type=ct)
+        for ct, (codename, name) in searched_perms
+        if (ct.pk, codename) not in all_perms
+    ]
+    Permission.objects.bulk_create(perms)
+
+
+after_patch = [_setup_custom_manager_methods, _setup_permissions]

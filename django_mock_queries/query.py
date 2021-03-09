@@ -3,9 +3,11 @@ import random
 from collections import OrderedDict, namedtuple
 from copy import copy
 
+from django.db.models import Q, BooleanField, Value
+from django.db.models.functions import Cast
 from six import with_metaclass
 
-from .storage import get_models_from_storage, remove_from_storage, add_to_storage
+from .storage import get_models_from_storage, remove_from_storage, add_to_storage, STORAGE
 
 try:
     from unittest.mock import Mock, MagicMock, PropertyMock
@@ -26,7 +28,6 @@ class MockSetMeta(type):
         # obj.add(*initial_items)
         return obj
 
-
 class MockSet(with_metaclass(MockSetMeta, MagicMock)):
     EVENT_ADDED = 'added'
     EVENT_UPDATED = 'updated'
@@ -44,7 +45,16 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         'iterator'
     ]
 
+    def none(self):
+        new = self._clone()
+        return new.annotate(x=Value(False, BooleanField())).filter(Q(x=True))
+
+    def __deepcopy__(self, memodict=None):
+        return self._clone()
+
     def _get_items(self):
+        if self._cached is not None and self._transaction_id == STORAGE.current_transaction_id:
+            return self._cached
         results = filter_objects(get_models_from_storage(self.model), self._filters)
 
         if self._exclusions:
@@ -64,10 +74,16 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
             if field == '?':
                 random.shuffle(results)
                 break
-            is_reversed = field.startswith('-')
-            attr = field[1:] if is_reversed else field
+            if isinstance(field, Cast):
+                attr = field.source_expressions[0].deconstruct()[1][0]
+                getter = lambda r: field.field.to_python(get_attribute(r, attr))
+                is_reversed = False
+            else:
+                is_reversed = field.startswith('-')
+                attr = field[1:] if is_reversed else field
+                getter = lambda r: get_attribute(r, attr)
             results = sorted(results,
-                             key=lambda r: get_attribute(r, attr),
+                             key=getter,
                              reverse=is_reversed)
 
         if self._distincts:
@@ -89,6 +105,8 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
                 results = []
                 for row in as_values:
                     results.append(self._values_row(row, self._values, **self._values_params))
+        self._cached = results
+        self._transaction_id = STORAGE.current_transaction_id
         return results
 
     def _clone(self):
@@ -117,8 +135,10 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
         self._exclusions = []
         self._filters = []
         self._order_by = []
+        self._transaction_id = None
         self._distincts = []
 
+        self._cached = None
         self.model = getattr(clone, 'model', model)
         self.clone = clone
         self.events = {}
@@ -313,12 +333,17 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
             for k, v in attrs.items():
                 setattr(item, k, v)
                 self.fire(item, self.EVENT_UPDATED, self.EVENT_SAVED)
+            add_to_storage(item)
 
         return count
 
-    def bulk_create(self, items):
+    def bulk_create(self, items, batch_size=None, ignore_conflicts=False):
         for item in items:
             add_to_storage(item)
+
+    def bulk_update(self, items, fields, batch_size=None):
+        for item in items:
+            item.save()
 
     def _delete_recursive(self, *items_to_remove, **attrs):
         for item in matches(*items_to_remove, **attrs):
@@ -391,7 +416,10 @@ class MockSet(with_metaclass(MockSetMeta, MagicMock)):
             field_names = list(fields)
 
         for field in sorted(field_names, key=lambda k: k.count('__')):
-            value = get_attribute(item, field)[0]
+            if isinstance(field, str) and hasattr(item, field + '_id'):
+                value = get_attribute(item, field + '_id')[0]
+            else:
+                value = get_attribute(item, field)[0]
 
             if is_list_like_iter(value):
                 value = flatten_list(value)
